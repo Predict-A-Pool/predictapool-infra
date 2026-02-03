@@ -83,7 +83,7 @@ resource "aws_ecs_task_definition" "backend" {
     container_definitions = jsonencode([
         {
             name = "backend"
-            image = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/predictapool-backend:dev-amd64"
+            image = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/predictapool-backend:git-efd4566"
             essential = true,
             portMappings = [
                 {
@@ -118,7 +118,7 @@ resource "aws_security_group" "backend" {
         from_port = 8000
         to_port = 8000
         protocol = "tcp"
-        cidr_blocks = ["0.0.0.0/0"]
+        security_groups = [aws_security_group.alb.id]
     }
 
     egress {
@@ -139,6 +139,143 @@ resource "aws_ecs_service" "backend" {
     network_configuration {
         subnets = data.aws_subnets.default.ids
         security_groups = [aws_security_group.backend.id]
-        assign_public_ip = true
+        assign_public_ip = false
     }
+
+    load_balancer {
+        target_group_arn = aws_lb_target_group.backend.arn
+        container_name = "backend"
+        container_port = 8000
+    }
+
+    depends_on = [aws_lb_listener.https]
+}
+
+resource "aws_security_group" "alb" {
+    name = "predictapool-alb-sg"
+    description = "Allow HTTP/HTTPS access to ALB"
+    vpc_id = data.aws_vpc.default.id
+
+    ingress {
+        from_port = 80
+        to_port = 80
+        protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+    
+    ingress {
+        from_port = 443
+        to_port = 443
+        protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+
+    egress {
+        from_port = 0
+        to_port = 0
+        protocol = "-1"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+}
+
+resource "aws_lb" "backend" {
+    name = "predictapool-backend-alb"
+    load_balancer_type = "application"
+    subnets = data.aws_subnets.default.ids
+    security_groups = [aws_security_group.alb.id]
+}
+
+resource "aws_lb_target_group" "backend" {
+    name = "predictapool-backend-tg"
+    port = 8000
+    protocol = "HTTP"
+    vpc_id = data.aws_vpc.default.id
+    target_type = "ip"
+
+    health_check {
+        path = "/health"
+        matcher = "200"
+        interval = 30
+        timeout = 5
+        healthy_threshold = 2
+        unhealthy_threshold = 2
+    }
+}
+
+resource "aws_lb_listener" "http" {
+    load_balancer_arn = aws_lb.backend.arn
+    port = 80
+    protocol = "HTTP"
+
+    default_action {
+        type = "redirect"
+        
+        redirect {
+            port = "443"
+            protocol = "HTTPS"
+            status_code = "HTTP_301"
+        }
+    }
+}
+
+resource "aws_lb_listener" "https" {
+    load_balancer_arn = aws_lb.backend.arn
+    port = 443
+    protocol = "HTTPS"
+    ssl_policy = "ELBSecurityPolicy-2016-08"
+    certificate_arn = aws_acm_certificate.api.arn
+
+    default_action {
+        type = "forward"
+        target_group_arn = aws_lb_target_group.backend.arn
+    }
+
+    depends_on = [aws_acm_certificate_validation.api]
+}
+
+resource "aws_acm_certificate" "api" {
+    domain_name = "api.predictapool.com"
+    validation_method = "DNS"
+
+    lifecycle {
+        create_before_destroy = true
+    }
+}
+
+resource "aws_route53_zone" "main" {
+  name = "predictapool.com"
+}
+
+resource "aws_route53_record" "api_cert_validation" {
+    for_each = {
+        for dvo in aws_acm_certificate.api.domain_validation_options :
+        dvo.domain_name => {
+            name = dvo.resource_record_name
+            record = dvo.resource_record_value
+            type = dvo.resource_record_type
+        }
+    }
+
+    zone_id = aws_route53_zone.main.zone_id
+    name = each.value.name
+    type = each.value.type
+    records = [each.value.record]
+    ttl = 60
+}
+
+resource "aws_route53_record" "api" {
+    zone_id = aws_route53_zone.main.zone_id
+    name = "api.predictapool.com"
+    type = "A"
+
+    alias {
+        name = aws_lb.backend.dns_name
+        zone_id = aws_lb.backend.zone_id
+        evaluate_target_health = true
+    }
+}
+
+resource "aws_acm_certificate_validation" "api" {
+    certificate_arn = aws_acm_certificate.api.arn
+    validation_record_fqdns = [for r in aws_route53_record.api_cert_validation : r.fqdn]
 }
