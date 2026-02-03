@@ -94,7 +94,7 @@ resource "aws_ecs_task_definition" "backend" {
             environment = [
                 {
                     name = "DATABASE_URL"
-                    value = "REPLACE_LATER"
+                    value = "postgresql+psycopg://${var.db_username}:${var.db_password}@${aws_db_instance.main.address}:5432/${var.db_name}"
                 }
             ]
             logConfiguration = {
@@ -246,6 +246,12 @@ resource "aws_route53_zone" "main" {
   name = "predictapool.com"
 }
 
+###########################################################################
+#
+#                               API
+#
+###########################################################################
+
 resource "aws_route53_record" "api_cert_validation" {
     for_each = {
         for dvo in aws_acm_certificate.api.domain_validation_options :
@@ -278,4 +284,70 @@ resource "aws_route53_record" "api" {
 resource "aws_acm_certificate_validation" "api" {
     certificate_arn = aws_acm_certificate.api.arn
     validation_record_fqdns = [for r in aws_route53_record.api_cert_validation : r.fqdn]
+}
+
+###########################################################################
+#
+#                               DATABASE
+#
+###########################################################################
+
+resource "aws_db_subnet_group" "main" {
+    name = "predictapool-db-subnets"
+    subnet_ids = data.aws_subnets.default.ids
+}
+
+resource "aws_security_group" "db" {
+    name = "predictapool-db-sg"
+    description = "Allow Postgres from backend"
+    vpc_id = data.aws_vpc.default.id
+
+    ingress {
+        from_port = 5432
+        to_port = 5432
+        protocol = "tcp"
+        security_groups = [aws_security_group.backend.id]
+    }
+
+    egress {
+        from_port = 0
+        to_port = 0
+        protocol = -1
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+}
+
+resource "aws_db_instance" "main" {
+    identifier = "predictapool-db"
+    engine = "postgres"
+    engine_version = "15.10"
+    instance_class = "db.t4g.micro"
+    allocated_storage = 20
+    max_allocated_storage = 100
+
+    db_name = var.db_name
+    username = var.db_username
+    password = var.db_password
+
+    db_subnet_group_name = aws_db_subnet_group.main.name
+    vpc_security_group_ids = [aws_security_group.db.id]
+
+    publicly_accessible = false
+    skip_final_snapshot = true
+    deletion_protection = false
+
+    backup_retention_period = 7
+}
+
+variable "db_name" {
+    type = string
+}
+
+variable "db_username" {
+    type = string
+}
+
+variable "db_password" {
+    type = string
+    sensitive = true
 }
