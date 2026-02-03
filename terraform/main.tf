@@ -1,10 +1,43 @@
+###########################################################################
+#
+#                           VARIABLES
+#
+###########################################################################
+
 variable "aws_region" {
     type = string
     description = "AWS region"
     default = "eu-central-1"
 }
 
+variable "root_domain" {
+  type        = string
+  description = "Root domain name (e.g. predictapool.com)"
+}
+
+variable "api_subdomain" {
+  type        = string
+  default     = "api"
+  description = "API subdomain prefix"
+}
+
+
+###########################################################################
+#
+#                           MAIN
+#
+###########################################################################
+
 data "aws_caller_identity" "current" {}
+
+locals {
+    api_domain = "${var.api_subdomain}.${var.root_domain}"
+}
+
+provider "aws" {
+    alias = "us_east_1"
+    region = "us-east-1"
+}
 
 resource "aws_ecr_repository" "backend" {
     name = "predictapool-backend"
@@ -151,6 +184,12 @@ resource "aws_ecs_service" "backend" {
     depends_on = [aws_lb_listener.https]
 }
 
+###########################################################################
+#
+#                           LOAD BALANCER
+#
+###########################################################################
+
 resource "aws_security_group" "alb" {
     name = "predictapool-alb-sg"
     description = "Allow HTTP/HTTPS access to ALB"
@@ -233,17 +272,26 @@ resource "aws_lb_listener" "https" {
     depends_on = [aws_acm_certificate_validation.api]
 }
 
-resource "aws_acm_certificate" "api" {
-    domain_name = "api.predictapool.com"
-    validation_method = "DNS"
-
-    lifecycle {
-        create_before_destroy = true
-    }
-}
+###########################################################################
+#
+#                           ROUTE53
+#
+###########################################################################
 
 resource "aws_route53_zone" "main" {
-  name = "predictapool.com"
+  name = var.root_domain
+}
+
+resource "aws_route53_record" "root" {
+    zone_id = aws_route53_zone.main.zone_id
+    name = var.root_domain
+    type = "A"
+
+    alias {
+        name = aws_cloudfront_distribution.landing.domain_name
+        zone_id = aws_cloudfront_distribution.landing.hosted_zone_id
+        evaluate_target_health = false
+    }
 }
 
 ###########################################################################
@@ -253,7 +301,7 @@ resource "aws_route53_zone" "main" {
 ###########################################################################
 
 resource "aws_s3_bucket" "landing" {
-    bucket = "predictapool.com"
+    bucket = var.root_domain
 }
 
 resource "aws_s3_bucket_public_access_block" "landing" {
@@ -265,11 +313,123 @@ resource "aws_s3_bucket_public_access_block" "landing" {
     restrict_public_buckets = true
 }
 
+# Give CloudFront read permission to S3 
+resource "aws_s3_bucket_policy" "landing" {
+    bucket = aws_s3_bucket.landing.id
+
+    policy = jsonencode({
+        Version = "2012-10-17"
+        Statement = [
+            {
+                Sid = "AllowCloudFrontRead"
+                Effect = "Allow"
+                Principal = {
+                    Service = "cloudfront.amazonaws.com"
+                }
+                Action = "s3:GetObject"
+                Resource = "${aws_s3_bucket.landing.arn}/*"
+                Condition = {
+                    StringEquals = {
+                        "AWS:SourceArn" = aws_cloudfront_distribution.landing.arn
+                    }
+                }
+            }
+        ]
+    })
+}
+
+resource "aws_acm_certificate" "landing" {
+    provider = aws.us_east_1
+    domain_name = var.root_domain
+    validation_method = "DNS"
+
+    lifecycle {
+        create_before_destroy = true
+    }
+}
+
+resource "aws_route53_record" "landing_cert_validation" {
+    for_each = {
+        for dvo in aws_acm_certificate.landing.domain_validation_options :
+        dvo.domain_name => {
+            name = dvo.resource_record_name
+            record = dvo.resource_record_value
+            type = dvo.resource_record_type
+        }
+    }
+
+    zone_id = aws_route53_zone.main.zone_id
+    name = each.value.name
+    type = each.value.type
+    records = [each.value.record]
+    ttl = 60
+}
+
+resource "aws_acm_certificate_validation" "landing" {
+    provider = aws.us_east_1
+    certificate_arn = aws_acm_certificate.landing.arn
+    validation_record_fqdns = [
+        for r in aws_route53_record.landing_cert_validation : r.fqdn
+    ]
+}
+
+resource "aws_cloudfront_origin_access_control" "landing" {
+    name = "predictapool-oac"
+    origin_access_control_origin_type = "s3"
+    signing_behavior = "always"
+    signing_protocol = "sigv4"
+}
+
+resource "aws_cloudfront_distribution" "landing" {
+    enabled = true
+    default_root_object = "index.html"
+    aliases = [var.root_domain]
+
+    origin {
+        domain_name = aws_s3_bucket.landing.bucket_regional_domain_name
+        origin_id = "s3-predictapool"
+        origin_access_control_id = aws_cloudfront_origin_access_control.landing.id
+    }
+
+    default_cache_behavior {
+        allowed_methods = ["GET", "HEAD"]
+        cached_methods = ["GET", "HEAD"]
+        target_origin_id = "s3-predictapool"
+
+        viewer_protocol_policy = "redirect-to-https"
+
+        forwarded_values {
+            query_string = false
+            cookies { forward = "none" }
+        }
+    }
+
+    viewer_certificate {
+        acm_certificate_arn = aws_acm_certificate.landing.arn
+        ssl_support_method = "sni-only"
+    }
+
+    restrictions {
+        geo_restriction { restriction_type = "none" }
+    }
+
+    depends_on = [aws_acm_certificate_validation.landing]
+}
+
 ###########################################################################
 #
 #                               API
 #
 ###########################################################################
+
+resource "aws_acm_certificate" "api" {
+    domain_name = local.api_domain
+    validation_method = "DNS"
+
+    lifecycle {
+        create_before_destroy = true
+    }
+}
 
 resource "aws_route53_record" "api_cert_validation" {
     for_each = {
@@ -290,7 +450,7 @@ resource "aws_route53_record" "api_cert_validation" {
 
 resource "aws_route53_record" "api" {
     zone_id = aws_route53_zone.main.zone_id
-    name = "api.predictapool.com"
+    name = local.api_domain
     type = "A"
 
     alias {
