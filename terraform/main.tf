@@ -115,7 +115,7 @@ resource "aws_ecs_task_definition" "frontend" {
   container_definitions = jsonencode([
     {
       name      = "frontend"
-      image     = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/predictapool-frontend:git-66d5651-amd64"
+      image     = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/predictapool-frontend:git-f84b5ab"
       essential = true
 
       portMappings = [
@@ -240,6 +240,37 @@ resource "aws_route53_record" "frontend" {
   }
 }
 
+resource "aws_route53_record" "frontend_cert_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.frontend.domain_validation_options :
+    dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  zone_id = aws_route53_zone.main.zone_id
+  name    = each.value.name
+  type    = each.value.type
+  records = [each.value.record]
+  ttl     = 60
+}
+
+resource "aws_acm_certificate_validation" "frontend" {
+  certificate_arn         = aws_acm_certificate.frontend.arn
+  validation_record_fqdns = [
+    for r in aws_route53_record.frontend_cert_validation : r.fqdn
+  ]
+}
+
+resource "aws_lb_listener_certificate" "frontend" {
+  listener_arn    = aws_lb_listener.https.arn
+  certificate_arn = aws_acm_certificate.frontend.arn
+
+  depends_on = [aws_acm_certificate_validation.frontend]
+}
+
 ###########################################################################
 #
 #                           BACKEND
@@ -275,7 +306,7 @@ resource "aws_ecs_task_definition" "backend" {
     container_definitions = jsonencode([
         {
             name = "backend"
-            image = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/predictapool-backend:git-f84b5ab-amd64"
+            image = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/predictapool-backend:git-f84b5ab"
             essential = true,
             portMappings = [
                 {
