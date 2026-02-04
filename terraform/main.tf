@@ -21,6 +21,11 @@ variable "api_subdomain" {
   description = "API subdomain prefix"
 }
 
+variable "app_subdomain" {
+    type = string
+    default = "app"
+    description = "APP subdomain prefix"
+}
 
 ###########################################################################
 #
@@ -30,39 +35,9 @@ variable "api_subdomain" {
 
 data "aws_caller_identity" "current" {}
 
-locals {
-    api_domain = "${var.api_subdomain}.${var.root_domain}"
-}
-
 provider "aws" {
     alias = "us_east_1"
     region = "us-east-1"
-}
-
-resource "aws_ecr_repository" "backend" {
-    name = "predictapool-backend"
-    image_tag_mutability = "IMMUTABLE"
-
-    image_scanning_configuration {
-        scan_on_push = true
-    }
-}
-
-resource "aws_ecr_repository" "frontend" {
-    name = "predictapool-frontend"
-    image_tag_mutability = "IMMUTABLE"
-
-    image_scanning_configuration {
-        scan_on_push = true
-    }
-}
-
-output "backend_ecr_url" {
-    value = aws_ecr_repository.backend.repository_url
-}
-
-output "frontend_ecr_url" {
-    value = aws_ecr_repository.frontend.repository_url
 }
 
 data "aws_vpc" "default" {
@@ -100,6 +75,190 @@ resource "aws_iam_role_policy_attachment" "ecs_exec_policy" {
     policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+###########################################################################
+#
+#                           FRONTEND
+#
+###########################################################################
+
+output "frontend_ecr_url" {
+    value = aws_ecr_repository.frontend.repository_url
+}
+
+locals {
+    app_domain = "${var.app_subdomain}.${var.root_domain}"
+}
+
+resource "aws_ecr_repository" "frontend" {
+    name = "predictapool-frontend"
+    image_tag_mutability = "IMMUTABLE"
+
+    image_scanning_configuration {
+        scan_on_push = true
+    }
+}
+
+# Setup CloudWatch Logs
+resource "aws_cloudwatch_log_group" "frontend" {
+  name              = "/ecs/predictapool-frontend"
+  retention_in_days = 7
+}
+
+resource "aws_ecs_task_definition" "frontend" {
+  family                   = "predictapool-frontend"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "frontend"
+      image     = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/predictapool-frontend:git-66d5651-amd64"
+      essential = true
+
+      portMappings = [
+        {
+          containerPort = 3000
+          protocol      = "tcp"
+        }
+      ]
+
+      environment = [
+        {
+          name  = "NEXT_PUBLIC_API_BASE_URL"
+          value = "https://${local.api_domain}"
+        }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.frontend.name
+          awslogs-region        = var.aws_region
+          awslogs-stream-prefix = "frontend"
+        }
+      }
+    }
+  ])
+}
+
+resource "aws_ecs_service" "frontend" {
+  name            = "predictapool-frontend"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.frontend.arn
+  launch_type     = "FARGATE"
+  desired_count   = 1
+
+  network_configuration {
+    subnets         = data.aws_subnets.default.ids
+    security_groups = [aws_security_group.frontend.id]
+    assign_public_ip = true
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.frontend.arn
+    container_name   = "frontend"
+    container_port   = 3000
+  }
+
+  depends_on = [aws_lb_listener.https]
+}
+
+resource "aws_security_group" "frontend" {
+  name        = "predictapool-frontend-sg"
+  description = "Allow ALB to access frontend"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    from_port       = 3000
+    to_port         = 3000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_lb_target_group" "frontend" {
+  name        = "predictapool-frontend-tg"
+  port        = 3000
+  protocol    = "HTTP"
+  vpc_id      = data.aws_vpc.default.id
+  target_type = "ip"
+
+  health_check {
+    path                = "/"
+    matcher             = "200"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
+}
+
+resource "aws_lb_listener_rule" "frontend" {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 10
+
+  condition {
+    host_header {
+      values = [local.app_domain]
+    }
+  }
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.frontend.arn
+  }
+}
+
+resource "aws_acm_certificate" "frontend" {
+  domain_name       = local.app_domain
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_route53_record" "frontend" {
+  zone_id = aws_route53_zone.main.zone_id
+  name    = local.app_domain
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.backend.dns_name
+    zone_id                = aws_lb.backend.zone_id
+    evaluate_target_health = true
+  }
+}
+
+###########################################################################
+#
+#                           BACKEND
+#
+###########################################################################
+
+output "backend_ecr_url" {
+    value = aws_ecr_repository.backend.repository_url
+}
+
+resource "aws_ecr_repository" "backend" {
+    name = "predictapool-backend"
+    image_tag_mutability = "IMMUTABLE"
+
+    image_scanning_configuration {
+        scan_on_push = true
+    }
+}
+
 resource "aws_cloudwatch_log_group" "backend" {
     name = "/ecs/predictapool-backend"
     retention_in_days = 7
@@ -116,7 +275,7 @@ resource "aws_ecs_task_definition" "backend" {
     container_definitions = jsonencode([
         {
             name = "backend"
-            image = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/predictapool-backend:git-efd4566-amd64"
+            image = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/predictapool-backend:git-f84b5ab-amd64"
             essential = true,
             portMappings = [
                 {
@@ -184,6 +343,30 @@ resource "aws_ecs_service" "backend" {
     depends_on = [aws_lb_listener.https]
 }
 
+resource "aws_lb" "backend" {
+    name = "predictapool-backend-alb"
+    load_balancer_type = "application"
+    subnets = data.aws_subnets.default.ids
+    security_groups = [aws_security_group.alb.id]
+}
+
+resource "aws_lb_target_group" "backend" {
+    name = "predictapool-backend-tg"
+    port = 8000
+    protocol = "HTTP"
+    vpc_id = data.aws_vpc.default.id
+    target_type = "ip"
+
+    health_check {
+        path = "/health"
+        matcher = "200"
+        interval = 30
+        timeout = 5
+        healthy_threshold = 2
+        unhealthy_threshold = 2
+    }
+}
+
 ###########################################################################
 #
 #                           LOAD BALANCER
@@ -214,30 +397,6 @@ resource "aws_security_group" "alb" {
         to_port = 0
         protocol = "-1"
         cidr_blocks = ["0.0.0.0/0"]
-    }
-}
-
-resource "aws_lb" "backend" {
-    name = "predictapool-backend-alb"
-    load_balancer_type = "application"
-    subnets = data.aws_subnets.default.ids
-    security_groups = [aws_security_group.alb.id]
-}
-
-resource "aws_lb_target_group" "backend" {
-    name = "predictapool-backend-tg"
-    port = 8000
-    protocol = "HTTP"
-    vpc_id = data.aws_vpc.default.id
-    target_type = "ip"
-
-    health_check {
-        path = "/health"
-        matcher = "200"
-        interval = 30
-        timeout = 5
-        healthy_threshold = 2
-        unhealthy_threshold = 2
     }
 }
 
@@ -421,6 +580,10 @@ resource "aws_cloudfront_distribution" "landing" {
 #                               API
 #
 ###########################################################################
+
+locals {
+    api_domain = "${var.api_subdomain}.${var.root_domain}"
+}
 
 resource "aws_acm_certificate" "api" {
     domain_name = local.api_domain
